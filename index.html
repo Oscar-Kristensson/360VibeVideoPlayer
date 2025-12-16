@@ -276,16 +276,22 @@ window.addEventListener("deviceorientation", e => {
     // We check orientation to attempt a fix.
     const orientation = window.screen.orientation ? window.screen.orientation.angle : window.orientation || 0;
     
-    if (orientation === 90 || orientation === -90) {
-       // Landscape
-       yaw = -ar; 
-       // In landscape, gamma often becomes pitch
-       pitch = gr + (orientation === 90 ? 1 : -1); 
-    } else {
-       // Portrait
-       yaw = -ar; 
-       pitch = br - Math.PI / 2;
-    }
+if (orientation === 90 || orientation === -90) {
+  // Landscape (Device held sideways)
+  // Yaw is usually alpha, Pitch is usually gamma (Z-axis tilt)
+  // Yaw inversion fix: Use +ar instead of -ar
+  currentYaw = ar; 
+   // Pitch inversion fix: Use -gr
+  // We also remove the +1 or -1 adjustment to simplify and fix inversion
+  currentPitch = -gr; 
+  } else {
+    // Portrait (Device held upright)
+    // Yaw is usually alpha, Pitch is usually beta (Front/Back tilt)
+         // Yaw inversion fix: Use +ar instead of -ar
+    currentYaw = ar; 
+         // Pitch inversion fix: Use -br.      // We also adjust the offset to center the view
+    currentPitch = -br + Math.PI / 2;
+  }
   }
 });
 
