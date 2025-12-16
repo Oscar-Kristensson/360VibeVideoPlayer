@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>360 Video – Universal</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: black; touch-action: none; font-family: sans-serif; }
+  canvas { width: 100%; height: 100%; display: block; }
+  
+  #fileInput {
+    position: absolute;
+    top: 20px;
+    left: 20px;
+    z-index: 10;
+    background: rgba(0,0,0,0.8);
+    padding: 10px;
+    border-radius: 8px;
+    color: white;
+    font-size: 14px;
+    border: 2px solid #666;
+  }
+
+  #controls {
+    position: absolute;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10;
+    background: rgba(0,0,0,0.8);
+    padding: 15px 20px;
+    border-radius: 8px;
+    color: white;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    flex-wrap: wrap;
+    justify-content: center;
+    width: 90%;
+    max-width: 600px;
+    box-sizing: border-box;
+  }
+
+  #videoControls {
+    display: none;
+    align-items: center;
+    gap: 10px;
+  }
+  #videoControls.visible { display: flex; }
+
+  .control-btn {
+    background: rgba(255,255,255,0.2);
+    border: 1px solid rgba(255,255,255,0.3);
+    color: white;
+    padding: 8px 15px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 14px;
+    white-space: nowrap;
+  }
+  .control-btn:hover { background: rgba(255,255,255,0.3); }
+  .control-btn:active { background: rgba(255,255,255,0.4); }
+
+  /* Specific Button Styles */
+  #vrToggle {
+    background: rgba(50,150,255,0.3);
+    border: 1px solid rgba(50,150,255,0.5);
+  }
+  #vrToggle.active {
+    background: rgba(50,200,50,0.4);
+    border-color: rgba(50,200,50,0.6);
+  }
+
+  #sensorBtn {
+    background: rgba(255, 100, 50, 0.3);
+    border: 1px solid rgba(255, 100, 50, 0.5);
+  }
+  #sensorBtn.active {
+    background: rgba(50,200,50,0.4);
+    border-color: rgba(50,200,50,0.6);
+  }
+
+  #fovSlider { width: 100px; margin: 0 10px; vertical-align: middle; }
+
+  @media (max-width: 768px) {
+    #fileInput { font-size: 12px; padding: 8px; top: 10px; left: 10px; max-width: 200px; overflow: hidden; }
+    #controls { bottom: 10px; padding: 10px; gap: 8px; }
+    .control-btn { padding: 6px 10px; font-size: 12px; }
+  }
+</style>
+</head>
+<body>
+
+<div style="position: absolute; top: 20px; left: 20px; z-index: 10;">
+  <input type="file" id="fileInput" accept="image/*,video/*">
+</div>
+
+<div id="controls">
+  <div id="videoControls">
+    <button id="playPauseBtn" class="control-btn">Pause</button>
+  </div>
+  
+  <button id="sensorBtn" class="control-btn">Enable Sensors</button>
+  <button id="vrToggle" class="control-btn">VR Mode</button>
+  
+  <div style="display: flex; align-items: center; gap: 5px;">
+    <label style="white-space:nowrap;">FOV: <span id="fovValue">90</span>°</label>
+    <input type="range" id="fovSlider" min="30" max="120" value="90" step="5">
+  </div>
+</div>
+
+<video id="video" loop muted playsinline webkit-playsinline crossorigin="anonymous" style="display:none"></video>
+<img id="image" crossorigin="anonymous" style="display:none">
+<canvas id="gl"></canvas>
+
+<script>
+const canvas = document.getElementById("gl");
+const gl = canvas.getContext("webgl");
+const video = document.getElementById("video");
+const image = document.getElementById("image");
+const fileInput = document.getElementById("fileInput");
+const fovSlider = document.getElementById("fovSlider");
+const fovValue = document.getElementById("fovValue");
+const playPauseBtn = document.getElementById("playPauseBtn");
+const videoControls = document.getElementById("videoControls");
+const vrToggle = document.getElementById("vrToggle");
+const sensorBtn = document.getElementById("sensorBtn");
+
+let mediaSource = null;
+let isVideo = false;
+let currentFov = 90;
+let vrMode = false;
+let useGyro = false;
+
+if (!gl) alert("WebGL not supported");
+
+canvas.width = innerWidth;
+canvas.height = innerHeight;
+gl.viewport(0, 0, canvas.width, canvas.height);
+
+// ---------- SHADERS ----------
+const vs = `
+attribute vec3 position;
+attribute vec2 uv;
+uniform mat4 projection;
+uniform mat4 view;
+varying vec2 vUv;
+void main() {
+  vUv = uv;
+  gl_Position = projection * view * vec4(position, 1.0);
+}`;
+const fs = `
+precision mediump float;
+varying vec2 vUv;
+uniform sampler2D tex;
+void main() {
+  gl_FragColor = texture2D(tex, vUv);
+}`;
+
+// ---------- COMPILE ----------
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s);
+  return s;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+// ---------- SPHERE ----------
+const lat = 30, lon = 40;
+const verts = [], uvs = [], idx = [];
+const radius = 10;
+
+for (let y = 0; y <= lat; y++) {
+  const v = y / lat;
+  const phi = v * Math.PI;
+  for (let x = 0; x <= lon; x++) {
+    const u = x / lon;
+    const theta = u * Math.PI * 2;
+    verts.push(
+      radius * Math.sin(phi) * Math.cos(theta),
+      radius * Math.cos(phi),
+      radius * Math.sin(phi) * Math.sin(theta)
+    );
+    uvs.push(u, v);
+  }
+}
+
+for (let y = 0; y < lat; y++) {
+  for (let x = 0; x < lon; x++) {
+    const i = y * (lon + 1) + x;
+    idx.push(i, i + lon + 1, i + 1);
+    idx.push(i + 1, i + lon + 1, i + lon + 2);
+  }
+}
+
+function buf(data, loc, size) {
+  const b = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+}
+
+buf(verts, gl.getAttribLocation(prog, "position"), 3);
+buf(uvs, gl.getAttribLocation(prog, "uv"), 2);
+
+const ib = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx), gl.STATIC_DRAW);
+
+// ---------- TEXTURE ----------
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+let textureUploaded = false;
+
+// ---------- CONTROLS & CAMERA ----------
+let yaw = 0, pitch = 0;
+let dragging = false, lx = 0, ly = 0;
+
+// Mouse
+canvas.onmousedown = e => { dragging = true; lx = e.clientX; ly = e.clientY; };
+canvas.onmouseup = () => { dragging = false; };
+canvas.onmousemove = e => {
+  if (!dragging) return;
+  yaw += (e.clientX - lx) * 0.005;
+  pitch += (e.clientY - ly) * 0.005;
+  pitch = Math.max(-1.5, Math.min(1.5, pitch));
+  lx = e.clientX; ly = e.clientY;
+};
+
+// Touch
+canvas.ontouchstart = e => {
+  if (e.touches.length === 1) { dragging = true; lx = e.touches[0].clientX; ly = e.touches[0].clientY; }
+};
+canvas.ontouchend = () => { dragging = false; };
+canvas.ontouchmove = e => {
+  if (!dragging || e.touches.length !== 1) return;
+  const touch = e.touches[0];
+  yaw += (touch.clientX - lx) * 0.005;
+  pitch += (touch.clientY - ly) * 0.005;
+  pitch = Math.max(-1.5, Math.min(1.5, pitch));
+  lx = touch.clientX; ly = touch.clientY;
+};
+
+// --- GYROSCOPE SUPPORT (Android & iOS) ---
+window.addEventListener("deviceorientation", e => {
+  if (!useGyro) return;
+  
+  // Note: Different devices have different orientation references.
+  // This is a basic implementation mapping alpha (yaw) and beta (pitch).
+  if (e.alpha !== null && e.beta !== null) {
+    // Convert degrees to radians
+    // Offset applied to make "holding phone up" natural
+    const ar = e.alpha * Math.PI / 180;
+    const br = e.beta * Math.PI / 180;
+    const gr = e.gamma * Math.PI / 180;
+
+    // Simple mapping: 
+    // Alpha is usually compass direction (Yaw)
+    // Beta is tilt front/back (Pitch)
+    
+    // In landscape mode, the axes swap relative to the screen. 
+    // We check orientation to attempt a fix.
+    const orientation = window.screen.orientation ? window.screen.orientation.angle : window.orientation || 0;
+    
+    if (orientation === 90 || orientation === -90) {
+       // Landscape
+       yaw = -ar; 
+       // In landscape, gamma often becomes pitch
+       pitch = gr + (orientation === 90 ? 1 : -1); 
+    } else {
+       // Portrait
+       yaw = -ar; 
+       pitch = br - Math.PI / 2;
+    }
+  }
+});
+
+// Universal Sensor Enable Button
+sensorBtn.onclick = () => {
+  // 1. Try iOS 13+ permission method
+  if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+    DeviceOrientationEvent.requestPermission()
+      .then(permissionState => {
+        if (permissionState === 'granted') {
+          useGyro = !useGyro; // Toggle
+          updateSensorBtn();
+        } else {
+          alert("Permission denied");
+        }
+      })
+      .catch(console.error);
+  } 
+  // 2. Android / Standard method
+  else {
+    useGyro = !useGyro; // Toggle
+    updateSensorBtn();
+    
+    // Diagnostic for Android:
+    if(useGyro && window.location.protocol === 'file:') {
+       alert("Note: Sensors often fail when opening a 'file://'. Please use a local server (http/https).");
+    }
+  }
+};
+
+function updateSensorBtn() {
+  if (useGyro) {
+    sensorBtn.textContent = "Sensors: ON";
+    sensorBtn.classList.add("active");
+  } else {
+    sensorBtn.textContent = "Enable Sensors";
+    sensorBtn.classList.remove("active");
+  }
+}
+
+// ---------- MATRICES ----------
+function perspective(fov, aspect, near, far) {
+  const f = 1.0 / Math.tan(fov / 2);
+  const nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0, 0,
+    0, f, 0, 0,
+    0, 0, (far + near) * nf, -1,
+    0, 0, 2 * far * near * nf, 0
+  ]);
+}
+
+function viewMatrix(y, p) {
+  const cy = Math.cos(y), sy = Math.sin(y);
+  const cp = Math.cos(p), sp = Math.sin(p);
+  return new Float32Array([
+     cy, sy*sp, sy*cp, 0,
+     0, cp, -sp, 0,
+     -sy, cy*sp, cy*cp, 0,
+     0, 0, 0, 1
+  ]);
+}
+
+const projLoc = gl.getUniformLocation(prog, "projection");
+const viewLoc = gl.getUniformLocation(prog, "view");
+let projection = perspective(currentFov * Math.PI / 180, canvas.width / canvas.height, 0.1, 100);
+
+// FOV & VR Logic
+fovSlider.oninput = (e) => {
+  currentFov = parseInt(e.target.value);
+  fovValue.textContent = currentFov;
+  updateProjection();
+};
+
+vrToggle.onclick = () => {
+  vrMode = !vrMode;
+  if (vrMode) {
+    vrToggle.textContent = 'Exit VR';
+    vrToggle.classList.add('active');
+    if (canvas.requestFullscreen) canvas.requestFullscreen();
+    else if (canvas.webkitRequestFullscreen) canvas.webkitRequestFullscreen();
+  } else {
+    vrToggle.textContent = 'VR Mode';
+    vrToggle.classList.remove('active');
+    if (document.exitFullscreen) document.exitFullscreen();
+    else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+  }
+  updateProjection();
+};
+
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement && vrMode) {
+    vrMode = false;
+    vrToggle.textContent = 'VR Mode';
+    vrToggle.classList.remove('active');
+    updateProjection();
+  }
+});
+
+function updateProjection() {
+  const aspect = vrMode ? (canvas.width / 2) / canvas.height : canvas.width / canvas.height;
+  projection = perspective(currentFov * Math.PI / 180, aspect, 0.1, 100);
+}
+
+gl.enable(gl.DEPTH_TEST);
+gl.disable(gl.CULL_FACE);
+
+// ---------- FILE HANDLING ----------
+fileInput.onchange = (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  if (file.type.startsWith('video/')) {
+    isVideo = true;
+    video.src = url;
+    mediaSource = video;
+    videoControls.classList.add('visible');
+    video.onloadeddata = () => {
+      video.play();
+      playPauseBtn.textContent = 'Pause';
+      textureUploaded = false;
+      if (!drawing) { drawing = true; draw(); }
+    };
+  } else if (file.type.startsWith('image/')) {
+    isVideo = false;
+    image.src = url;
+    mediaSource = image;
+    videoControls.classList.remove('visible');
+    image.onload = () => {
+      textureUploaded = false;
+      if (!drawing) { drawing = true; draw(); }
+    };
+  }
+};
+
+playPauseBtn.onclick = () => {
+  if (!isVideo || !mediaSource) return;
+  if (video.paused) {
+    video.play();
+    playPauseBtn.textContent = 'Pause';
+  } else {
+    video.pause();
+    playPauseBtn.textContent = 'Play';
+  }
+};
+
+let drawing = false;
+
+// ---------- RENDER LOOP ----------
+function draw() {
+  requestAnimationFrame(draw);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  if (mediaSource) {
+    if (isVideo && mediaSource.readyState >= 2) {
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, mediaSource);
+    } else if (!isVideo && !textureUploaded && mediaSource.complete) {
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, mediaSource);
+      textureUploaded = true;
+    }
+  }
+  
+  gl.uniformMatrix4fv(projLoc, false, projection);
+
+  if (vrMode) {
+    // Left
+    gl.viewport(0, 0, canvas.width / 2, canvas.height);
+    gl.uniformMatrix4fv(viewLoc, false, viewMatrix(yaw + 0.032, pitch));
+    gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_SHORT, 0);
+    // Right
+    gl.viewport(canvas.width / 2, 0, canvas.width / 2, canvas.height);
+    gl.uniformMatrix4fv(viewLoc, false, viewMatrix(yaw - 0.032, pitch));
+    gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_SHORT, 0);
+  } else {
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.uniformMatrix4fv(viewLoc, false, viewMatrix(yaw, pitch));
+    gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_SHORT, 0);
+  }
+}
+</script>
+</body>
+</html>
